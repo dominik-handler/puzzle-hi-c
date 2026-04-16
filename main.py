@@ -2,8 +2,11 @@
 # coding: utf-8
 
 import argparse
+from array import array
+import glob
 import os
 import pickle
+import shutil
 import subprocess
 import sys
 from multiprocessing import Pool, cpu_count
@@ -49,6 +52,47 @@ conection_dict={'00':'es','01':'ee','10':'ss','11':'se'}
 ## 反向
 AGP_HEADER=["Chromosome", "Start", "End", "Order", "Tag", "Contig_ID", "Contig_start",
                                          "Contig_end", "Orientation"]
+PICKLE_PROTOCOL = pickle.HIGHEST_PROTOCOL
+WRITE_BUFFER_LIMIT = 10000
+GLOBAL_REPEAT_DENSITY_CONTEXT = None
+REPEAT_DENSITY_CONTEXT = None
+LINK_CONTEXT = None
+
+
+def dump_pickle(obj):
+    return np.void(pickle.dumps(obj, protocol=PICKLE_PROTOCOL))
+
+
+def load_pickle(value):
+    if isinstance(value, np.void):
+        value = value.tobytes()
+    return pickle.loads(value)
+
+
+def remove_path(path):
+    if os.path.isdir(path):
+        shutil.rmtree(path)
+    elif os.path.exists(path):
+        os.remove(path)
+
+
+def cleanup_paths(pattern):
+    for path in glob.glob(pattern):
+        remove_path(path)
+
+
+def merge_files(pattern, outputfile):
+    with open(outputfile, "wb") as outfile:
+        for path in sorted(glob.glob(pattern)):
+            with open(path, "rb") as infile:
+                shutil.copyfileobj(infile, outfile, length=1024 * 1024)
+
+
+def merge_tmp_re_files(prefix, outputfile, clean_tmp=False):
+    merge_files(os.path.join("tmp", f"{prefix}*.re"), outputfile)
+    if clean_tmp:
+        cleanup_paths(os.path.join("tmp", "*"))
+
 
 def generate_seq(seq, list_seg):
     seqs = []
@@ -94,16 +138,19 @@ def split_contactmat(inputfile, outputfile, agpfile):
 
 ### 读取全局的重复序列密度
 def read_gloable_repeat_density(filename):
-    with h5py.File("tmp/repeat_dict.h5", "r") as repeat_h5:
-        repeat_dict = pickle.loads(repeat_h5["repeat_dict"][()])
-        size_dict = pickle.loads(repeat_h5["size_dict"][()])
-        binsize = repeat_h5["binsize"][()]
-        Scaffolds_len_dict = pickle.loads(repeat_h5["Scaffolds_len_dict"][()])
+    if GLOBAL_REPEAT_DENSITY_CONTEXT is None:
+        with h5py.File("tmp/repeat_dict.h5", "r") as repeat_h5:
+            size_dict = load_pickle(repeat_h5["size_dict"][()])
+            binsize = repeat_h5["binsize"][()]
+    else:
+        size_dict = GLOBAL_REPEAT_DENSITY_CONTEXT["size_dict"]
+        binsize = GLOBAL_REPEAT_DENSITY_CONTEXT["binsize"]
 
+    repeat_dict = {}
     with open(filename) as inputfile:
         str1, chr1, pos1, frag1, str2, chr2, pos2, frag2 = 0, 1, 2, 3, 4, 5, 6, 7
         for rawitem in inputfile:
-            item = rawitem.strip().split()
+            item = rawitem.strip().split(maxsplit=7)
             if (item[chr1] not in size_dict) or (item[chr1] != item[chr2]):
                 continue
             #             end1=Scaffolds_len_dict[item[chr1]]
@@ -115,12 +162,14 @@ def read_gloable_repeat_density(filename):
             #             end_bin1=end_pos1//binsize
             #             end_bin2=end_pos2//binsize
             if bin1 == bin2:
-                #                 if bin1<size_dict[item[1]]:
-                repeat_dict[item[1]][bin1] += 1
+                if bin1 < size_dict[item[1]]:
+                    if item[1] not in repeat_dict:
+                        repeat_dict[item[1]] = np.zeros(size_dict[item[1]], dtype=np.int32)
+                    repeat_dict[item[1]][bin1] += 1
     #                 if end_bin1<size_dict[item[1]]:
     #                     repeat_dict[item[1]]["end"][end_bin1]+=1
     with h5py.File("{}.h5".format(filename), "w") as repeat_h5:
-        repeat_h5["repeat_dict"] = pickle.dumps(repeat_dict, protocol=0)
+        repeat_h5["repeat_dict"] = dump_pickle(repeat_dict)
 
 
 ### 简化内存使用量
@@ -138,22 +187,77 @@ def return_dict_matrix(maxlength):
     # b_len = Scaffolds_len_dict[b]
     b_bin = maxlength
     #         size_dict[b]=b_bin
-    matrix_dict = {"left_up": np.zeros((a_bin, b_bin)), "left_down": np.zeros(
-        (a_bin, b_bin)), "right_up": np.zeros((a_bin, b_bin)),
-                   "right_down": np.zeros((a_bin, b_bin))}
+    matrix_dict = {"left_up": np.zeros((a_bin, b_bin), dtype=np.int32), "left_down": np.zeros(
+        (a_bin, b_bin), dtype=np.int32), "right_up": np.zeros((a_bin, b_bin), dtype=np.int32),
+                   "right_down": np.zeros((a_bin, b_bin), dtype=np.int32)}
     return matrix_dict
+
+
+def reset_dict_matrix(matrix_dict):
+    for matrix in matrix_dict.values():
+        matrix.fill(0)
+
+
+def weighted_triangle_sum(counts, row_weight, col_weight, row_mask, col_mask, trianglesize):
+    row_idx = np.flatnonzero(row_mask)
+    col_idx = np.flatnonzero(col_mask)
+    if row_idx.size == 0 or col_idx.size == 0:
+        return 0.0
+    weighted = counts[np.ix_(row_idx, col_idx)].astype(np.float64, copy=False)
+    weighted *= row_weight[row_idx, None]
+    weighted *= col_weight[col_idx][None, :]
+    rows, cols = weighted.shape
+    diagonal_offset = trianglesize - rows
+    total = 0.0
+    for row in range(rows):
+        last_col = min(cols, row + diagonal_offset + 1)
+        if last_col > 0:
+            total += weighted[rows - row - 1, :last_col].sum(dtype=np.float64)
+    return total
+
+
+def score_matrix_pair(matrix_dict, norm_weight, repeat_offset_dict, x, y, trianglesize):
+    lus = weighted_triangle_sum(matrix_dict["left_up"], norm_weight[x]["start"], norm_weight[y]["start"],
+                                repeat_offset_dict[x]["start"], repeat_offset_dict[y]["start"], trianglesize)
+    lds = weighted_triangle_sum(matrix_dict["left_down"], norm_weight[x]["end"], norm_weight[y]["start"],
+                                repeat_offset_dict[x]["end"], repeat_offset_dict[y]["start"], trianglesize)
+    rus = weighted_triangle_sum(matrix_dict["right_up"], norm_weight[x]["start"], norm_weight[y]["end"],
+                                repeat_offset_dict[x]["start"], repeat_offset_dict[y]["end"], trianglesize)
+    rds = weighted_triangle_sum(matrix_dict["right_down"], norm_weight[x]["end"], norm_weight[y]["end"],
+                                repeat_offset_dict[x]["end"], repeat_offset_dict[y]["end"], trianglesize)
+    return lus, lds, rus, rds
+
+
+def stable_top_k_indices(row, k):
+    k = min(k, row.size)
+    if k <= 0:
+        return np.array([], dtype=np.intp)
+    threshold = np.partition(row, row.size - k)[row.size - k]
+    greater = np.flatnonzero(row > threshold)
+    need = k - greater.size
+    if need <= 0:
+        return greater
+    equal = np.flatnonzero(row == threshold)
+    return np.concatenate((greater, equal[-need:]))
+
+
+def top_k_sum(row, k):
+    k = min(k, row.size)
+    if k <= 0:
+        return 0
+    return np.partition(row, row.size - k)[row.size - k:].sum()
 
 
 def read_raw_data(filename):
     with h5py.File("tmp/{}.h5".format("rawtemp"), "r") as rawdata:
-        ord_scaffold_dict = pickle.loads(rawdata["ord_scaffold_dict"][()])
+        ord_scaffold_dict = load_pickle(rawdata["ord_scaffold_dict"][()])
     with open(filename) as inputfile:
         with open(filename + ".re", 'w') as outputfile:
             tmp_write = []
             count = 0
             #             inputfile.readline()
             for item in inputfile:
-                itemlist = item.strip().split('\t')
+                itemlist = item.strip().split('\t', 7)
                 if len(itemlist) != 8:
                     continue
                 if (itemlist[1] in ord_scaffold_dict) and (itemlist[5] in ord_scaffold_dict):
@@ -161,7 +265,7 @@ def read_raw_data(filename):
                         itemlist[0:4], itemlist[4:8] = itemlist[4:8], itemlist[0:4]
                     tmp_write.append("\t".join(itemlist) + '\n')
                     count += 1
-                    if count > 1999:
+                    if count >= WRITE_BUFFER_LIMIT:
                         outputfile.writelines(tmp_write)
                         tmp_write = []
                         count = 0
@@ -171,16 +275,21 @@ def read_raw_data(filename):
 
 
 def read_repeat_density(filename):
-    with h5py.File("tmp/repeat_dict.h5", "r") as repeat_h5:
-        repeat_dict = pickle.loads(repeat_h5["repeat_dict"][()])
-        size_dict = pickle.loads(repeat_h5["size_dict"][()])
-        binsize = repeat_h5["binsize"][()]
-        Scaffolds_len_dict = pickle.loads(repeat_h5["Scaffolds_len_dict"][()])
+    if REPEAT_DENSITY_CONTEXT is None:
+        with h5py.File("tmp/repeat_dict.h5", "r") as repeat_h5:
+            size_dict = load_pickle(repeat_h5["size_dict"][()])
+            binsize = repeat_h5["binsize"][()]
+            Scaffolds_len_dict = load_pickle(repeat_h5["Scaffolds_len_dict"][()])
+    else:
+        size_dict = REPEAT_DENSITY_CONTEXT["size_dict"]
+        binsize = REPEAT_DENSITY_CONTEXT["binsize"]
+        Scaffolds_len_dict = REPEAT_DENSITY_CONTEXT["Scaffolds_len_dict"]
 
+    repeat_dict = {}
     with open(filename) as inputfile:
         str1, chr1, pos1, frag1, str2, chr2, pos2, frag2 = 0, 1, 2, 3, 4, 5, 6, 7
         for rawitem in inputfile:
-            item = rawitem.strip().split()
+            item = rawitem.strip().split(maxsplit=7)
             if (item[chr1] not in size_dict) or (item[chr1] != item[chr2]):
                 continue
             end1 = Scaffolds_len_dict[item[chr1]]
@@ -194,189 +303,126 @@ def read_repeat_density(filename):
             end_bin1 = end_pos1 // binsize
             # end_bin2 = end_pos2 // binsize
             if bin1 == bin2:
-                if bin1 < size_dict[item[1]]:
-                    repeat_dict[item[1]]["start"][bin1] += 1
-                if end_bin1 < size_dict[item[1]]:
-                    repeat_dict[item[1]]["end"][end_bin1] += 1
+                if (bin1 < size_dict[item[1]]) or (end_bin1 < size_dict[item[1]]):
+                    if item[1] not in repeat_dict:
+                        repeat_dict[item[1]] = {"start": np.zeros(size_dict[item[1]], dtype=np.int32),
+                                                "end": np.zeros(size_dict[item[1]], dtype=np.int32)}
+                    if bin1 < size_dict[item[1]]:
+                        repeat_dict[item[1]]["start"][bin1] += 1
+                    if end_bin1 < size_dict[item[1]]:
+                        repeat_dict[item[1]]["end"][end_bin1] += 1
     with h5py.File("{}.h5".format(filename), "w") as repeat_h5:
-        repeat_h5["repeat_dict"] = pickle.dumps(repeat_dict, protocol=0)
+        repeat_h5["repeat_dict"] = dump_pickle(repeat_dict)
 
 
 def get_links(filename):
-    with h5py.File("tmp/links.h5", "r") as links:
-        repeat_offset_dict = pickle.loads(links["repeat_offset_dict"][()])
-        size_dict = pickle.loads(links["size_dict"][()])
-        binsize = links["binsize"][()]
-        maxlength = links["maxlength"][()]
-        trianglesize = links["trianglesize"][()]
-        Scaffolds_len_dict = pickle.loads(links["Scaffolds_len_dict"][()])
-        ord_scaffold_dict = pickle.loads(links["ord_scaffold_dict"][()])
-        norm_weight = pickle.loads(links["norm_weight"][()])
-        # Contig_ID = pickle.loads(links["Contig_ID"][()])
+    if LINK_CONTEXT is None:
+        with h5py.File("tmp/links.h5", "r") as links:
+            repeat_offset_dict = load_pickle(links["repeat_offset_dict"][()])
+            size_dict = load_pickle(links["size_dict"][()])
+            binsize = links["binsize"][()]
+            maxlength = links["maxlength"][()]
+            trianglesize = links["trianglesize"][()]
+            Scaffolds_len_dict = load_pickle(links["Scaffolds_len_dict"][()])
+            ord_scaffold_dict = load_pickle(links["ord_scaffold_dict"][()])
+            norm_weight = load_pickle(links["norm_weight"][()])
+            # Contig_ID = load_pickle(links["Contig_ID"][()])
+    else:
+        repeat_offset_dict = LINK_CONTEXT["repeat_offset_dict"]
+        size_dict = LINK_CONTEXT["size_dict"]
+        binsize = LINK_CONTEXT["binsize"]
+        maxlength = LINK_CONTEXT["maxlength"]
+        trianglesize = LINK_CONTEXT["trianglesize"]
+        Scaffolds_len_dict = LINK_CONTEXT["Scaffolds_len_dict"]
+        ord_scaffold_dict = LINK_CONTEXT["ord_scaffold_dict"]
+        norm_weight = LINK_CONTEXT["norm_weight"]
     with open("{}.txt".format(filename), "w") as links:
         with open(filename) as inputfile:
-            with h5py.File("{}.h5".format(filename), "w") as matrix_h5:
-                rawitem = inputfile.readline()
-                if not rawitem:
-                    return
-                item = rawitem.strip().split()
-                scaffold = item[1]
-                scaffold2 = item[5]
-                matrix_dict = return_dict_matrix(maxlength)
-                str1, chr1, pos1, frag1, str2, chr2, pos2, frag2 = 0, 1, 2, 3, 4, 5, 6, 7
-                inputfile.seek(0)
-                for rawitem in inputfile:
-                    item = rawitem.strip().split()
-                    if (item[chr1] not in ord_scaffold_dict) or (item[chr2] not in ord_scaffold_dict) or (
-                            item[chr1] == item[chr2]):
-                        continue
-                    tmp_scaffold = item[chr1]
-                    tmp_scaffold2 = item[chr2]
-                    # if tmp_scaffold == "868186":
-                    #     print(item, tmp_scaffold, tmp_scaffold2)
-                    if ord_scaffold_dict[tmp_scaffold] > ord_scaffold_dict[tmp_scaffold2]:
-                        print("error!file not sort!")
-                    end1 = Scaffolds_len_dict[item[chr1]]
-                    end2 = Scaffolds_len_dict[item[chr2]]
-                    num_pos1=min(int(item[pos1]),end1)
-                    num_pos2 = min(int(item[pos2]), end2)
-                    end_pos1 = end1 - num_pos1 + 1
-                    end_pos2 = end2 - num_pos2 + 1
-                    bin1 = num_pos1 // binsize
-                    bin2 = num_pos2 // binsize
-                    end_bin1 = end_pos1 // binsize
-                    end_bin2 = end_pos2 // binsize
-                    if (scaffold != tmp_scaffold) or (scaffold2 != tmp_scaffold2):
-                        # print("Procesing")
-                        x = scaffold
-                        y = scaffold2
-                        # if x=="868186":
-                        #     print(rawitem,x,y)
-                        lunw = norm_weight[x]["start"].reshape((maxlength, 1)).dot(
-                            norm_weight[y]["start"].reshape((1, maxlength)))
-                        # lums=lum.sum()+1
-                        ldnw = norm_weight[x]["end"].reshape((maxlength, 1)).dot(
-                            norm_weight[y]["start"].reshape((1, maxlength)))
-                        # ldms=ldm.sum()+1
-                        runw = norm_weight[x]["start"].reshape((maxlength, 1)).dot(
-                            norm_weight[y]["end"].reshape((1, maxlength)))
-                        # rums=rum.sum()+1
-                        rdnw = norm_weight[x]["end"].reshape((maxlength, 1)).dot(
-                            norm_weight[y]["end"].reshape((1, maxlength)))
-                        # rdms=rdm.sum()+1
+            link_write = []
+            rawitem = inputfile.readline()
+            if not rawitem:
+                return
+            item = rawitem.strip().split(maxsplit=7)
+            scaffold = item[1]
+            scaffold2 = item[5]
+            matrix_dict = return_dict_matrix(maxlength)
+            left_up = matrix_dict["left_up"]
+            right_up = matrix_dict["right_up"]
+            left_down = matrix_dict["left_down"]
+            right_down = matrix_dict["right_down"]
+            str1, chr1, pos1, frag1, str2, chr2, pos2, frag2 = 0, 1, 2, 3, 4, 5, 6, 7
+            inputfile.seek(0)
+            for rawitem in inputfile:
+                item = rawitem.strip().split(maxsplit=7)
+                if (item[chr1] not in ord_scaffold_dict) or (item[chr2] not in ord_scaffold_dict) or (
+                        item[chr1] == item[chr2]):
+                    continue
+                tmp_scaffold = item[chr1]
+                tmp_scaffold2 = item[chr2]
+                # if tmp_scaffold == "868186":
+                #     print(item, tmp_scaffold, tmp_scaffold2)
+                if ord_scaffold_dict[tmp_scaffold] > ord_scaffold_dict[tmp_scaffold2]:
+                    print("error!file not sort!")
+                end1 = Scaffolds_len_dict[tmp_scaffold]
+                end2 = Scaffolds_len_dict[tmp_scaffold2]
+                num_pos1=min(int(item[pos1]),end1)
+                num_pos2 = min(int(item[pos2]), end2)
+                end_pos1 = end1 - num_pos1 + 1
+                end_pos2 = end2 - num_pos2 + 1
+                bin1 = num_pos1 // binsize
+                bin2 = num_pos2 // binsize
+                end_bin1 = end_pos1 // binsize
+                end_bin2 = end_pos2 // binsize
+                if (scaffold != tmp_scaffold) or (scaffold2 != tmp_scaffold2):
+                    # print("Procesing")
+                    x = scaffold
+                    y = scaffold2
+                    # if x=="868186":
+                    #     print(rawitem,x,y)
+                    lus, lds, rus, rds = score_matrix_pair(matrix_dict, norm_weight, repeat_offset_dict,
+                                                           x, y, trianglesize)
 
-                        lum = repeat_offset_dict[x]["start"].reshape((maxlength, 1)).dot(
-                            repeat_offset_dict[y]["start"].reshape((1, maxlength)))
-                        lums = lum.sum() + 1
-                        ldm = repeat_offset_dict[x]["end"].reshape((maxlength, 1)).dot(
-                            repeat_offset_dict[y]["start"].reshape((1, maxlength)))
-                        ldms = ldm.sum() + 1
-                        rum = repeat_offset_dict[x]["start"].reshape((maxlength, 1)).dot(
-                            repeat_offset_dict[y]["end"].reshape((1, maxlength)))
-                        rums = rum.sum() + 1
-                        rdm = repeat_offset_dict[x]["end"].reshape((maxlength, 1)).dot(
-                            repeat_offset_dict[y]["end"].reshape((1, maxlength)))
-                        rdms = rdm.sum() + 1
+                    # lus = (np.tril(lu[::-1, ])).sum()*(1+maxlength)*maxlength/2/lums
+                    # lds = (np.tril(ld[::-1, ])[::-1, ]).sum()*(1+maxlength)*maxlength/2/ldms
+                    # rus = (np.tril(ru[::-1, ])[::-1, ]).sum()*(1+maxlength)*maxlength/2/rums
+                    # rds = (np.tril(rd[::-1, ])[::-1, ]).sum()*(1+maxlength)*maxlength/2/rdms
+                    link_write.append("{0}\t{1}\t{2:.0f}\t{3:.0f}\t{4:.0f}\t{5:.0f}\n".format(x, y, lus, lds, rus, rds))
+                    if len(link_write) >= WRITE_BUFFER_LIMIT:
+                        links.writelines(link_write)
+                        link_write = []
+                    #                     links["{}/{}".format(x,y)]=np.array([lus,lds,rus,rds],dtype=np.int32)
+                    #                     wight_matrix[ord_scaffold_dict[y],ord_scaffold_dict[x]]=wight_matrix[
+                    #                         ord_scaffold_dict[x],ord_scaffold_dict[y]]=max([lus,lds,rus,rds])
+                    #                     tri_weight[ord_scaffold_dict[x],ord_scaffold_dict[y]]=np.argmax([lus,lds,rus,rds])
+                    scaffold = tmp_scaffold
+                    scaffold2 = tmp_scaffold2
+                    reset_dict_matrix(matrix_dict)
 
-                        lu = matrix_dict["left_up"] * lunw * lum
-                        ld = matrix_dict["left_down"] * ldnw * ldm
-                        ru = matrix_dict["right_up"] * runw * rum
-                        rd = matrix_dict["right_down"] * rdnw * rdm
-
-                        lu = lu[np.argwhere(repeat_offset_dict[x]["start"] == 1).flatten(),][:,
-                             np.argwhere(repeat_offset_dict[y]["start"] == 1).flatten()]
-                        ld = ld[np.argwhere(repeat_offset_dict[x]["end"] == 1).flatten(),][:,
-                             np.argwhere(repeat_offset_dict[y]["start"] == 1).flatten()]
-                        ru = ru[np.argwhere(repeat_offset_dict[x]["start"] == 1).flatten(),][:,
-                             np.argwhere(repeat_offset_dict[y]["end"] == 1).flatten()]
-                        rd = rd[np.argwhere(repeat_offset_dict[x]["end"] == 1).flatten(),][:,
-                             np.argwhere(repeat_offset_dict[y]["end"] == 1).flatten()]
-
-                        lus = np.tril(lu[::-1, ], trianglesize - lu.shape[0]).sum()
-                        lds = np.tril(ld[::-1, ], trianglesize - ld.shape[0]).sum()
-                        rus = np.tril(ru[::-1, ], trianglesize - ru.shape[0]).sum()
-                        rds = np.tril(rd[::-1, ], trianglesize - rd.shape[0]).sum()
-
-                        # lus = (np.tril(lu[::-1, ])).sum()*(1+maxlength)*maxlength/2/lums
-                        # lds = (np.tril(ld[::-1, ])[::-1, ]).sum()*(1+maxlength)*maxlength/2/ldms
-                        # rus = (np.tril(ru[::-1, ])[::-1, ]).sum()*(1+maxlength)*maxlength/2/rums
-                        # rds = (np.tril(rd[::-1, ])[::-1, ]).sum()*(1+maxlength)*maxlength/2/rdms
-                        links.write("{0}\t{1}\t{2:.0f}\t{3:.0f}\t{4:.0f}\t{5:.0f}\n".format(x, y, lus, lds, rus, rds))
-                        matrix_h5[f"{x}/{y}/lu"] = pickle.dumps(lu, protocol=0)
-                        matrix_h5[f"{x}/{y}/ld"] = pickle.dumps(ld, protocol=0)
-                        matrix_h5[f"{x}/{y}/ru"] = pickle.dumps(ru, protocol=0)
-                        matrix_h5[f"{x}/{y}/rd"] = pickle.dumps(rd, protocol=0)
-                        #                     links["{}/{}".format(x,y)]=np.array([lus,lds,rus,rds],dtype=np.int32)
-                        #                     wight_matrix[ord_scaffold_dict[y],ord_scaffold_dict[x]]=wight_matrix[
-                        #                         ord_scaffold_dict[x],ord_scaffold_dict[y]]=max([lus,lds,rus,rds])
-                        #                     tri_weight[ord_scaffold_dict[x],ord_scaffold_dict[y]]=np.argmax([lus,lds,rus,rds])
-                        scaffold = tmp_scaffold
-                        scaffold2 = tmp_scaffold2
-                        matrix_dict = return_dict_matrix(maxlength)
-
-                    if (item[1] == scaffold) and (item[5] == scaffold2):
-                        if bin1 < size_dict[item[1]]:
-                            if bin2 < size_dict[item[5]]:
-                                matrix_dict["left_up"][bin1][bin2] += 1
-                            if end_bin2 < size_dict[item[5]]:
-                                matrix_dict["right_up"][bin1][end_bin2] += 1
-                        if end_bin1 < size_dict[item[1]]:
-                            if bin2 < size_dict[item[5]]:
-                                matrix_dict["left_down"][end_bin1][bin2] += 1
-                            if end_bin2 < size_dict[item[5]]:
-                                matrix_dict["right_down"][end_bin1][end_bin2] += 1
-                x = scaffold
-                y = scaffold2
-                lunw = norm_weight[x]["start"].reshape((maxlength, 1)).dot(norm_weight[y]["start"].reshape((1, maxlength)))
-                # lums=lum.sum()+1
-                ldnw = norm_weight[x]["end"].reshape((maxlength, 1)).dot(norm_weight[y]["start"].reshape((1, maxlength)))
-                # ldms=ldm.sum()+1
-                runw = norm_weight[x]["start"].reshape((maxlength, 1)).dot(norm_weight[y]["end"].reshape((1, maxlength)))
-                # rums=rum.sum()+1
-                rdnw = norm_weight[x]["end"].reshape((maxlength, 1)).dot(norm_weight[y]["end"].reshape((1, maxlength)))
-                # rdms=rdm.sum()+1
-
-                lum = repeat_offset_dict[x]["start"].reshape((maxlength, 1)).dot(
-                    repeat_offset_dict[y]["start"].reshape((1, maxlength)))
-                # lums = lum.sum() + 1
-                ldm = repeat_offset_dict[x]["end"].reshape((maxlength, 1)).dot(
-                    repeat_offset_dict[y]["start"].reshape((1, maxlength)))
-                # ldms = ldm.sum() + 1
-                rum = repeat_offset_dict[x]["start"].reshape((maxlength, 1)).dot(
-                    repeat_offset_dict[y]["end"].reshape((1, maxlength)))
-                # rums = rum.sum() + 1
-                rdm = repeat_offset_dict[x]["end"].reshape((maxlength, 1)).dot(
-                    repeat_offset_dict[y]["end"].reshape((1, maxlength)))
-                # rdms = rdm.sum() + 1
-
-                lu = matrix_dict["left_up"] * lunw * lum
-                ld = matrix_dict["left_down"] * ldnw * ldm
-                ru = matrix_dict["right_up"] * runw * rum
-                rd = matrix_dict["right_down"] * rdnw * rdm
-
-                lu = lu[np.argwhere(repeat_offset_dict[x]["start"] == 1).flatten(),][:,
-                     np.argwhere(repeat_offset_dict[y]["start"] == 1).flatten()]
-                ld = ld[np.argwhere(repeat_offset_dict[x]["end"] == 1).flatten(),][:,
-                     np.argwhere(repeat_offset_dict[y]["start"] == 1).flatten()]
-                ru = ru[np.argwhere(repeat_offset_dict[x]["start"] == 1).flatten(),][:,
-                     np.argwhere(repeat_offset_dict[y]["end"] == 1).flatten()]
-                rd = rd[np.argwhere(repeat_offset_dict[x]["end"] == 1).flatten(),][:,
-                     np.argwhere(repeat_offset_dict[y]["end"] == 1).flatten()]
-
-                lus = np.tril(lu[::-1, ], trianglesize - lu.shape[0]).sum()
-                lds = np.tril(ld[::-1, ], trianglesize - ld.shape[0]).sum()
-                rus = np.tril(ru[::-1, ], trianglesize - ru.shape[0]).sum()
-                rds = np.tril(rd[::-1, ], trianglesize - rd.shape[0]).sum()
-                links.write("{0}\t{1}\t{2:.0f}\t{3:.0f}\t{4:.0f}\t{5:.0f}\n".format(x, y, lus, lds, rus, rds))
-                matrix_h5[f"{x}/{y}/lu"]= pickle.dumps(lu,protocol=0)
-                matrix_h5[f"{x}/{y}/ld"] = pickle.dumps(ld, protocol=0)
-                matrix_h5[f"{x}/{y}/ru"] = pickle.dumps(ru, protocol=0)
-                matrix_h5[f"{x}/{y}/rd"] = pickle.dumps(rd, protocol=0)
+                if (tmp_scaffold == scaffold) and (tmp_scaffold2 == scaffold2):
+                    size1 = size_dict[tmp_scaffold]
+                    size2 = size_dict[tmp_scaffold2]
+                    if bin1 < size1:
+                        if bin2 < size2:
+                            left_up[bin1, bin2] += 1
+                        if end_bin2 < size2:
+                            right_up[bin1, end_bin2] += 1
+                    if end_bin1 < size1:
+                        if bin2 < size2:
+                            left_down[end_bin1, bin2] += 1
+                        if end_bin2 < size2:
+                            right_down[end_bin1, end_bin2] += 1
+            x = scaffold
+            y = scaffold2
+            lus, lds, rus, rds = score_matrix_pair(matrix_dict, norm_weight, repeat_offset_dict,
+                                                   x, y, trianglesize)
+            link_write.append("{0}\t{1}\t{2:.0f}\t{3:.0f}\t{4:.0f}\t{5:.0f}\n".format(x, y, lus, lds, rus, rds))
+            if link_write:
+                links.writelines(link_write)
 
 
 def count_links(contactdata_filename, Scaffolds_len_dict, trianglesize, clusters, average_links, binsize=10000,
                 Process_num=10):
-    batch_size = 100000
+    global REPEAT_DENSITY_CONTEXT, LINK_CONTEXT
     threshold = 30
     Contig_ID = []
     maxlength = trianglesize * 10
@@ -392,21 +438,20 @@ def count_links(contactdata_filename, Scaffolds_len_dict, trianglesize, clusters
         ord_scaffold_dict[Contig_ID[i]] = i
     #     print(Contig_ID)
     #     Contig_ID_Array=Array(c.c_wchar_p,Contig_ID)
-    weight = []
-    config_dicts = []
     norm_weight = {}
     # matrix_dict = {}
     repeat_dict = {}
     repeat_offset_dict = {}
     #     repeat_h5=h5py.File("/data2/luoj/hicassemble/matrix_dict.h5","w")
     wight_matrix = np.zeros((len(Contig_ID), len(Contig_ID)), dtype=np.int32)
-    wight_matrix_mat = np.zeros((len(Contig_ID), len(Contig_ID), 4), dtype=np.int32)
-    tri_weight = np.zeros((len(Contig_ID), len(Contig_ID)), dtype=np.int16)
+    tri_weight = np.zeros((len(Contig_ID), len(Contig_ID)), dtype=np.int8)
     tri_weight[:] = -1
+    for i in range(len(Contig_ID) - 1):
+        tri_weight[i, i + 1:] = 0
     print("reading raw data!")
     ## 实现多线程
     with h5py.File("tmp/{}.h5".format("rawtemp"), "w") as rawdata:
-        rawdata["ord_scaffold_dict"] = pickle.dumps(ord_scaffold_dict, protocol=0)
+        rawdata["ord_scaffold_dict"] = dump_pickle(ord_scaffold_dict)
     subprocess.run("split -a 3 -n l/{0} -d {1} tmp/{2};".format(Process_num,
                                                                contactdata_filename, "rawtemp"), shell=True, check=True,
                    stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -415,8 +460,7 @@ def count_links(contactdata_filename, Scaffolds_len_dict, trianglesize, clusters
         list_temp_names.append("tmp/{0}{1:0>3d}".format("rawtemp", i))
     with Pool(processes=Process_num) as pool:
         pool.map(read_raw_data, list_temp_names)
-    subprocess.run("cat tmp/{0}*.re >{1}.re".format(
-        "rawtemp", contactdata_filename), shell=True, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    merge_tmp_re_files("rawtemp", "{0}.re".format(contactdata_filename))
 
     print("sort raw data!")
     subprocess.run("LC_ALL=C sort -k2,2 -k6,6 {0}.re >{0}.re.sort".format(
@@ -428,27 +472,34 @@ def count_links(contactdata_filename, Scaffolds_len_dict, trianglesize, clusters
         # a_len = Scaffolds_len_dict[a]
         a_bin = maxlength
         size_dict[a] = a_bin
-        repeat_dict[a] = {"start": np.zeros(a_bin), "end": np.zeros(a_bin)}
+        repeat_dict[a] = {"start": np.zeros(a_bin, dtype=np.int32), "end": np.zeros(a_bin, dtype=np.int32)}
         repeat_offset_dict[a] = {"start": trianglesize, "end": trianglesize}
         norm_weight[a] = {"start": trianglesize, "end": trianglesize}
     print("processing repeat files")
     ### 并行化读取
     with h5py.File("tmp/repeat_dict.h5", "w") as repeat_h5:
-        repeat_h5["repeat_dict"] = pickle.dumps(repeat_dict, protocol=0)
-        repeat_h5["size_dict"] = pickle.dumps(size_dict, protocol=0)
+        repeat_h5["size_dict"] = dump_pickle(size_dict)
         repeat_h5["binsize"] = binsize
-        repeat_h5["Scaffolds_len_dict"] = pickle.dumps(Scaffolds_len_dict, protocol=0)
+        repeat_h5["Scaffolds_len_dict"] = dump_pickle(Scaffolds_len_dict)
 
-    with Pool(processes=Process_num) as pool:
-        pool.map(read_repeat_density, list_temp_names)
+    REPEAT_DENSITY_CONTEXT = {
+        "size_dict": size_dict,
+        "binsize": binsize,
+        "Scaffolds_len_dict": Scaffolds_len_dict,
+    }
+    try:
+        with Pool(processes=Process_num) as pool:
+            pool.map(read_repeat_density, list_temp_names)
+    finally:
+        REPEAT_DENSITY_CONTEXT = None
     for temp_name in list_temp_names:
         with h5py.File("{}.h5".format(temp_name), "r") as repeat_h5:
-            repeat_dict_temp = pickle.loads(repeat_h5["repeat_dict"][()])
-        for x in repeat_dict:
-            repeat_dict[x]["start"] += repeat_dict_temp[x]["start"]
-            repeat_dict[x]["end"] += repeat_dict_temp[x]["end"]
-    subprocess.run("rm tmp/{0}*;rm {1}.re".format(
-        "rawtemp", contactdata_filename), shell=True, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            repeat_dict_temp = load_pickle(repeat_h5["repeat_dict"][()])
+        for x, values in repeat_dict_temp.items():
+            repeat_dict[x]["start"] += values["start"]
+            repeat_dict[x]["end"] += values["end"]
+    cleanup_paths(os.path.join("tmp", "rawtemp*"))
+    remove_path("{0}.re".format(contactdata_filename))
     print("processing repeat flags")
     for x in repeat_dict:
         for y in repeat_dict[x]:
@@ -473,81 +524,85 @@ def count_links(contactdata_filename, Scaffolds_len_dict, trianglesize, clusters
                                                                        contactdata_filename, "sortemp"), shell=True,
                    check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     with h5py.File("tmp/links.h5", "w") as links:
-        links["repeat_offset_dict"] = pickle.dumps(repeat_offset_dict, protocol=0)
-        links["norm_weight"] = pickle.dumps(norm_weight, protocol=0)
-        links["size_dict"] = pickle.dumps(size_dict, protocol=0)
+        links["repeat_offset_dict"] = dump_pickle(repeat_offset_dict)
+        links["norm_weight"] = dump_pickle(norm_weight)
+        links["size_dict"] = dump_pickle(size_dict)
         links["binsize"] = binsize
         links["trianglesize"] = trianglesize
         links["maxlength"] = maxlength
-        links["Scaffolds_len_dict"] = pickle.dumps(Scaffolds_len_dict, protocol=0)
-        links["ord_scaffold_dict"] = pickle.dumps(ord_scaffold_dict, protocol=0)
-        links["Contig_ID"] = pickle.dumps(Contig_ID, protocol=0)
+        links["Scaffolds_len_dict"] = dump_pickle(Scaffolds_len_dict)
+        links["ord_scaffold_dict"] = dump_pickle(ord_scaffold_dict)
+        links["Contig_ID"] = dump_pickle(Contig_ID)
     list_temp_names = []
     for i in range(Process_num):
         list_temp_names.append("tmp/{0}{1:0>3d}".format("sortemp", i))
-    with Pool(processes=Process_num) as pool:
-        pool.map(get_links, list_temp_names)
+    LINK_CONTEXT = {
+        "repeat_offset_dict": repeat_offset_dict,
+        "norm_weight": norm_weight,
+        "size_dict": size_dict,
+        "binsize": binsize,
+        "trianglesize": trianglesize,
+        "maxlength": maxlength,
+        "Scaffolds_len_dict": Scaffolds_len_dict,
+        "ord_scaffold_dict": ord_scaffold_dict,
+    }
+    try:
+        with Pool(processes=Process_num) as pool:
+            pool.map(get_links, list_temp_names)
+    finally:
+        LINK_CONTEXT = None
+    wight_matrix_mat_sparse = {}
     for temp_name in list_temp_names:
         with open("{}.txt".format(temp_name), "r") as links:
             for item in links:
                 item_list = item.strip().split("\t")
                 scaffold = item_list[0]
                 scaffold2 = item_list[1]
-                data = np.array([int(x) for x in item_list[2:]], dtype=np.int32)
-                wight_matrix_mat[ord_scaffold_dict[scaffold],
-                                 ord_scaffold_dict[scaffold2]] += data
+                i = ord_scaffold_dict[scaffold]
+                j = ord_scaffold_dict[scaffold2]
+                key = (i, j)
+                data = wight_matrix_mat_sparse.get(key)
+                if data is None:
+                    wight_matrix_mat_sparse[key] = array("i", (int(x) for x in item_list[2:]))
+                else:
+                    data[0] += int(item_list[2])
+                    data[1] += int(item_list[3])
+                    data[2] += int(item_list[4])
+                    data[3] += int(item_list[5])
 
-    for i in range(len(Contig_ID)):
-        for j in range(i + 1, len(Contig_ID)):
-            wight_matrix[i, j] = wight_matrix[j, i] = max(wight_matrix_mat[i, j])
-            tri_weight[i, j] = np.argmax(wight_matrix_mat[i, j])
-    order_list=["lu", "ld", "ru", "rd"]
-    wight_matrix_mat_raw = {}
+    for (i, j), data in wight_matrix_mat_sparse.items():
+        max_value = max(data)
+        wight_matrix[i, j] = max_value
+        wight_matrix[j, i] = max_value
+        tri_weight[i, j] = data.index(max_value)
     for temp_name in list_temp_names:
-        with open("{}.txt".format(temp_name), "r") as links:
-            with h5py.File("{}.h5".format(temp_name), "r") as _raw:
-                for item in links:
-                    item_list = item.strip().split("\t")
-                    scaffold = item_list[0]
-                    scaffold2 = item_list[1]
-                    # data = np.array([int(x) for x in item_list[2:]], dtype=np.int32)
-                    i=ord_scaffold_dict[scaffold]
-                    j=ord_scaffold_dict[scaffold2]
-                    if i>=j:
-                        i,j=j,i
-                    k=tri_weight[i,j]
-                    data_raw_ = np.array(pickle.loads(_raw[f"{scaffold}/{scaffold2}/{order_list[k]}"][()]))
-                    # print(i,scaffold,j,scaffold2,k)
-                    # print(data_raw_)
-                    if f"{i}_{j}_{k}" in wight_matrix_mat_raw:
-                        wight_matrix_mat_raw[f"{i}_{j}_{k}"] += data_raw_
-                    else:
-                        wight_matrix_mat_raw[f"{i}_{j}_{k}"] = data_raw_
+        for tmp_path in (temp_name, "{}.txt".format(temp_name)):
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
 
     os.remove("{0}.re.sort".format(contactdata_filename))
+    del wight_matrix_mat_sparse
     wight_matrix_norm = np.zeros_like(wight_matrix, dtype=np.float16)
 
     #     print(wight_matrix)
     matrix_len=wight_matrix.shape[1]
     for i in range(len(wight_matrix)):
         wight_matrix[i, i] = 0
-        top_count = max(wight_matrix[i, :])
+        top_count = wight_matrix[i, :].max()
         if top_count <= threshold:
             wight_matrix[i, :] = 0
-        tempsum = sum(wight_matrix[i][np.argsort(-wight_matrix[i], kind="mergesort")[:min(5,matrix_len)]])
+        tempsum = top_k_sum(wight_matrix[i, :], min(5, matrix_len))
         if tempsum == 0:
             tempsum = 1
         wight_matrix_norm[i, :] = wight_matrix[i, :] / tempsum
-    weight.append(wight_matrix)
-    config_dicts.append(Contig_ID)
     target_scaffold_len_dict = {}
     for scaffold in Contig_ID:
         target_scaffold_len_dict[scaffold] = Scaffolds_len_dict[scaffold]
     # 获取统计数据
     # with h5py.File("{0}.h5".format(contactdata_filename), "w") as matrix_h5:
-    #     matrix_h5["dict"]=pickle.dumps(wight_matrix_mat_raw,protocol=0)
-    #     matrix_h5["ord_scaffold_dict"]=pickle.dumps(ord_scaffold_dict,protocol=0)
-    #     matrix_h5["wight_matrix"] = pickle.dumps(wight_matrix, protocol=0)
+    #     matrix_h5["dict"]=pickle.dumps(wight_matrix_mat_raw,protocol=PICKLE_PROTOCOL)
+    #     matrix_h5["ord_scaffold_dict"]=pickle.dumps(ord_scaffold_dict,protocol=PICKLE_PROTOCOL)
+    #     matrix_h5["wight_matrix"] = dump_pickle(wight_matrix)
     # np.savez("{0}.matrix".format(contactdata_filename), wight_matrix)
     return wight_matrix_norm, tri_weight, Contig_ID, target_scaffold_len_dict, False
 
@@ -625,7 +680,7 @@ def generate_grahp(score, cutoff):
         edges1 = set([])
         edges2 = set([])
         for i in range(len(score)):
-            two_max_index = np.argsort(score[i], kind="mergesort")[-2:]
+            two_max_index = stable_top_k_indices(score[i], 2)
             for j in two_max_index:
                 if i < j:
                     edges1.add((i, j))
@@ -660,14 +715,13 @@ def generate_agp(final_path, final_path_orientation, index, index_Scaffold_dict,
 
 def survey_contactmat(inputfile):
     with h5py.File("tmp/convert.h5", "r") as convert:
-        Scaffold_dict_list = pickle.loads(convert["Scaffold_dict_list"][()])
-        scaffold_index_dict = pickle.loads(convert["scaffold_index_dict"][()])
-        fake_chrom_dict = pickle.loads(convert["fake_chrom_dict"][()])
-        faker_scaffold_len_dict=pickle.loads(convert["faker_scaffold_len_dict"][()])
+        Scaffold_dict_list = load_pickle(convert["Scaffold_dict_list"][()])
+        scaffold_index_dict = load_pickle(convert["scaffold_index_dict"][()])
+        fake_chrom_dict = load_pickle(convert["fake_chrom_dict"][()])
+        faker_scaffold_len_dict=load_pickle(convert["faker_scaffold_len_dict"][()])
         binsize = convert["binsize"][()]
-        # convert["faker_scaffold_len_dict"] = pickle.dumps(faker_scaffold_len_dict, protocol=0)
+        # convert["faker_scaffold_len_dict"] = dump_pickle(faker_scaffold_len_dict)
     # add function for correction
-    correct_dict={}
     correct_array={}
     # with h5py.File(f"tmp/{inputfile}.h5",'w') as stats:
     with open(inputfile) as HiCdata:
@@ -675,8 +729,7 @@ def survey_contactmat(inputfile):
         count=0
         # with open(inputfile + ".re", 'w') as Record:
         for x in HiCdata:
-            x = x.strip()
-            x = x.split("\t")
+            x = x.rstrip("\n").split("\t", 7)
             if (x[1] in scaffold_index_dict) and (x[5] in scaffold_index_dict):
                 chr1index = scaffold_index_dict[x[1]]
                 chr1info = Scaffold_dict_list[chr1index][x[1]]
@@ -710,16 +763,6 @@ def survey_contactmat(inputfile):
                             else:
                                 correct_array[chr1][1][pos1 // binsize] += 1
                                 correct_array[chr1][0][pos2 // binsize] += 1
-                    elif (pos2//binsize)==(pos1//binsize):
-                        if chr1 not in correct_dict:
-                            correct_dict[chr1] = np.zeros(faker_scaffold_len_dict[chr1] // binsize + 1,
-                                                          dtype=np.int32)
-                            # correct_array[chr1]=np.zeros((2,faker_scaffold_len_dict[chr1] // binsize + 1),
-                            #                               dtype=np.int32)
-                        correct_dict[chr1][pos1 // binsize] += 1
-                        # correct_dict[chr1][pos2 // binsize] += 1
-
-
                 # x[1] = chr1
                 # x[5] = chr2
                 # x[2] = str(pos1)
@@ -734,15 +777,14 @@ def survey_contactmat(inputfile):
             # if len(tmp_write)>0:
             #     Record.writelines(tmp_write)
     with h5py.File(f"{inputfile}.h5",'w') as stats:
-        stats["correct_dict"]=pickle.dumps(correct_dict,protocol=0)
-        stats["correct_array"] = pickle.dumps(correct_array, protocol=0)
+        stats["correct_array"] = dump_pickle(correct_array)
 
 
 def convert_contactmat(inputfile):
     with h5py.File("tmp/convert.h5", "r") as convert:
-        Scaffold_dict_list = pickle.loads(convert["Scaffold_dict_list"][()])
-        scaffold_index_dict = pickle.loads(convert["scaffold_index_dict"][()])
-        fake_chrom_dict = pickle.loads(convert["fake_chrom_dict"][()])
+        Scaffold_dict_list = load_pickle(convert["Scaffold_dict_list"][()])
+        scaffold_index_dict = load_pickle(convert["scaffold_index_dict"][()])
+        fake_chrom_dict = load_pickle(convert["fake_chrom_dict"][()])
     JBAT.convert_contact_txt(inputfile, Scaffold_dict_list, scaffold_index_dict, fake_chrom_dict)
 
 def build_index_scaffold(Scaffold_dict):
@@ -752,14 +794,18 @@ def build_index_scaffold(Scaffold_dict):
     return index_Scaffold_dict
 
 
-def buil_oritention_matrix(oritention):
-    for i in range(len(oritention)):
-        for j in range(i + 1, len(oritention)):
-            if (oritention[i, j] == 1) or (oritention[i, j] == 2):
-                oritention[j, i] = 3 - oritention[i, j]
-            else:
-                oritention[j, i] = oritention[i, j]
+def mirror_orientation_matrix(oritention):
+    for i in range(len(oritention) - 1):
+        target = oritention[i + 1:, i]
+        target[:] = oritention[i, i + 1:]
+        flip_mask = (target == 1) | (target == 2)
+        if flip_mask.any():
+            target[flip_mask] = 3 - target[flip_mask]
     return oritention
+
+
+def buil_oritention_matrix(oritention):
+    return mirror_orientation_matrix(oritention)
 
 
 # def sovle_thepath(score, Scaffold_len_Dict, clusters, genome_total_size):
@@ -878,31 +924,30 @@ def generate_scaffold_info(agp_list,gap=100):
             Scaffold_dict[x[5]] = [x[7], x[8], x[1], x[2]]
         Scaffold_dict_list.append(Scaffold_dict)
     ##生成迭代的agp文件
-    interation_agp = pd.DataFrame(data=[],
-                                  columns=AGP_HEADER)
-    for tempagp in agp_list:
-        interation_agp = pd.concat([interation_agp,tempagp])   # Add support for pandas2
+    interation_agp = pd.concat(agp_list, ignore_index=True) if agp_list else pd.DataFrame(columns=AGP_HEADER)
     return faker_scaffold_len_dict,scaffold_index_dict,fake_chrom_dict,Scaffold_dict_list,interation_agp
 
 def split_agp(agpfile,arr):
     templist_agp=[]
     print(arr)
     for i in range(1,len(arr)):
-        temp_agp=agpfile.iloc[arr[i-1]:arr[i],:]
-        temp_agp["Chromosome"]=agpfile.iloc[0,0]+"_break_"+str(i)
-        temp_agp["Start"]=1
-        temp_agp["End"]=temp_agp.iloc[0,7]
-        for j in range(1,len(temp_agp)):
-            temp_agp.iloc[j,1]=temp_agp.iloc[j-1,2]+1+100
-            temp_agp.iloc[j,2]=temp_agp.iloc[j,1]+temp_agp.iloc[j,7]-1
-        templist_agp.append(temp_agp)
+        rows = []
+        chrom_name = agpfile.iloc[0, 0] + "_break_" + str(i)
+        start = 1
+        for agp_row in agpfile.iloc[arr[i-1]:arr[i], :].values:
+            row = list(agp_row)
+            row[0] = chrom_name
+            row[1] = start
+            row[2] = start + int(row[7]) - 1
+            rows.append(row)
+            start = row[2] + 1 + 100
+        templist_agp.append(pd.DataFrame(data=rows, columns=AGP_HEADER))
     return templist_agp
 
 
 def find_closest_value(arr, target):
     low = 0
     high = len(arr) - 1
-    closest = None
     midv=0
     while low < high:
         mid = (low + high) // 2
@@ -938,7 +983,7 @@ def survey_contig(list_temp_names,Process_num,debug=False):
     for correct_dict_file_name in list_temp_names:
         # print(f"")
         with h5py.File(f"{correct_dict_file_name}.h5", 'r') as stats:
-            temp_correct = pickle.loads(stats["correct_array"][()])
+            temp_correct = load_pickle(stats["correct_array"][()])
             for chr1 in temp_correct:
                 if chr1 in correct_dict:
                     correct_dict[chr1] += temp_correct[chr1]
@@ -953,20 +998,13 @@ def survey_contig(list_temp_names,Process_num,debug=False):
             plt.savefig(f"correct_file/{tpc}_log.jpg")
             plt.cla()
         with h5py.File(f"{code}_{iteration}_correct_dict.h5", 'w') as correct_file:
-            correct_file["correct_dict"] = pickle.dumps(correct_dict, protocol=0)
+            correct_file["correct_dict"] = dump_pickle(correct_dict)
     return correct_dict
 
 def sovle_link(inputfile, outputfile, score, oritention, Scaffold_dict, Scaffold_len_Dict, iteration, agpfilename, init_agp,
                cutoff, Process_num=10, binsize=10000, error_correction=False, gap=100):
-    index_Scaffold_dict = {}
-    for key in range(len(Scaffold_dict)):
-        index_Scaffold_dict[key] = Scaffold_dict[key]
-    for i in range(len(oritention)):
-        for j in range(i + 1, len(oritention)):
-            if (oritention[i, j] == 1) or (oritention[i, j] == 2):
-                oritention[j, i] = 3 - oritention[i, j]
-            else:
-                oritention[j, i] = oritention[i, j]
+    index_Scaffold_dict = dict(enumerate(Scaffold_dict))
+    mirror_orientation_matrix(oritention)
     #     length=Scaffold_len_Dict[index_Scaffold_dict[0]]
     #     for scaffold_index in Scaffold_len_Dict:
     #         length=min(length,Scaffold_len_Dict[scaffold_index])
@@ -1097,13 +1135,12 @@ def sovle_link(inputfile, outputfile, score, oritention, Scaffold_dict, Scaffold
                                                                inputfile, "convertemp"), shell=True, check=True,
                    stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if iteration>0:
-        subprocess.run("rm {0}".format(inputfile), shell=True, check=True,
-                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        remove_path(inputfile)
     with h5py.File("tmp/convert.h5", "w") as convert:
-        convert["Scaffold_dict_list"] = pickle.dumps(Scaffold_dict_list, protocol=0)
-        convert["scaffold_index_dict"] = pickle.dumps(scaffold_index_dict, protocol=0)
-        convert["fake_chrom_dict"] = pickle.dumps(fake_chrom_dict, protocol=0)
-        convert["faker_scaffold_len_dict"] = pickle.dumps(faker_scaffold_len_dict, protocol=0)
+        convert["Scaffold_dict_list"] = dump_pickle(Scaffold_dict_list)
+        convert["scaffold_index_dict"] = dump_pickle(scaffold_index_dict)
+        convert["fake_chrom_dict"] = dump_pickle(fake_chrom_dict)
+        convert["faker_scaffold_len_dict"] = dump_pickle(faker_scaffold_len_dict)
         convert["binsize"] = binsize
     list_temp_names = []
     for i in range(Process_num):
@@ -1117,7 +1154,7 @@ def sovle_link(inputfile, outputfile, score, oritention, Scaffold_dict, Scaffold
     # for correct_dict_file_name in list_temp_names:
     #     # print(f"")
     #     with h5py.File(f"{correct_dict_file_name}.h5", 'r') as stats:
-    #         temp_correct = pickle.loads(stats["correct_array"][()])
+    #         temp_correct = load_pickle(stats["correct_array"][()])
     #         for chr1 in temp_correct:
     #             if chr1 in correct_dict:
     #                 correct_dict[chr1] += temp_correct[chr1]
@@ -1131,7 +1168,7 @@ def sovle_link(inputfile, outputfile, score, oritention, Scaffold_dict, Scaffold
     #     plt.savefig(f"correct_file/{tpc}_log.jpg")
     #     plt.cla()
     # with h5py.File(f"{code}_{iteration}_correct_dict.h5", 'w') as correct_file:
-    #     correct_file["correct_dict"] = pickle.dumps(correct_dict, protocol=0)
+    #     correct_file["correct_dict"] = dump_pickle(correct_dict)
     if error_correction:    # break agp file
         correct_dict = survey_contig(list_temp_names, Process_num)
         tmp_agp_list=[]
@@ -1168,76 +1205,58 @@ def sovle_link(inputfile, outputfile, score, oritention, Scaffold_dict, Scaffold
             tmp_agp_list,gap)
         interation_agp.to_csv(agpfilename.format(iteration), sep="\t",header=False, index=False)
         with h5py.File("tmp/convert.h5", "w") as convert:
-            convert["Scaffold_dict_list"] = pickle.dumps(Scaffold_dict_list, protocol=0)
-            convert["scaffold_index_dict"] = pickle.dumps(scaffold_index_dict, protocol=0)
-            convert["fake_chrom_dict"] = pickle.dumps(fake_chrom_dict, protocol=0)
-            convert["faker_scaffold_len_dict"] = pickle.dumps(faker_scaffold_len_dict, protocol=0)
+            convert["Scaffold_dict_list"] = dump_pickle(Scaffold_dict_list)
+            convert["scaffold_index_dict"] = dump_pickle(scaffold_index_dict)
+            convert["fake_chrom_dict"] = dump_pickle(fake_chrom_dict)
+            convert["faker_scaffold_len_dict"] = dump_pickle(faker_scaffold_len_dict)
             convert["binsize"] = binsize
         list_temp_names = []
         for i in range(Process_num):
             list_temp_names.append("tmp/{0}{1:0>3d}".format("convertemp", i))
     with Pool(processes=Process_num) as pool:
         pool.map(convert_contactmat, list_temp_names)
-    subprocess.run("cat tmp/{0}*.re >{1};rm tmp/*".format("convertemp",
-                                                          outputfile), shell=True, check=True, stdout=subprocess.PIPE,
-                   stderr=subprocess.PIPE)
+    merge_tmp_re_files("convertemp", outputfile, clean_tmp=True)
     #     convert_contactmat(inputfile,outputfile,Scaffold_dict_list,scaffold_index_dict,fake_chrom_dict)
     return faker_scaffold_len_dict
 
 
 def generate_final_agp(Chrom_Dict,gap):
     Orientation2sign={0:"+",1:"-"}
-    all_agp = pd.DataFrame(data=[], columns=AGP_HEADER)
     agp_list=[]
     for chrom in Chrom_Dict:
-        temp_list = []
-        for i in range(len(Chrom_Dict[chrom]["Scaffold"])):
-            Chromosome = chrom
-            Start = 1
-            End = Chrom_Dict[chrom]["Scaffold_len"][i]
-            Order = 1
-            Tag = "W"
-            Contig_ID = Chrom_Dict[chrom]["Scaffold"][i]
-            Contig_start = Start
-            Contig_end = End
-            Orientation = Chrom_Dict[chrom]["Oritention"][i]
-            temp_data = [Chromosome, Start, End, Order, Tag, Contig_ID, Contig_start, Contig_end, Orientation2sign[Orientation]]
-            temp_list.append(temp_data)
-        tempagp = pd.DataFrame(data=temp_list,
-                               columns=AGP_HEADER)
-        tempagp["Start"] = 1
-        tempagp["End"] = int(tempagp.iloc[0, 7])
-        #         scaffold_index_dict[agp_list[i].iloc[0,5]]=i
-        #         fake_chrom_dict.append(agp_list[i].iloc[0,0])
-        for j in range(1, len(tempagp)):
-            #             scaffold_index_dict[agp_list[i].iloc[j,5]]=i
-            tempagp.iloc[j, 1] = int(tempagp.iloc[j - 1, 2]) + 1 + gap
-            tempagp.iloc[j, 2] = int(tempagp.iloc[j, 1]) + int(tempagp.iloc[j, 7]) - 1
-        tempagpwithgap=[]
-        for j in range(len(tempagp)-1):
-            tempagp.iloc[j, 3]=2*j+1
-            tempagpwithgap.append(list(tempagp.iloc[j, :]))
-            gap_item = [chrom, tempagp.iloc[j, 2]+1, tempagp.iloc[j+1, 1]-1, 2*(j+1), "U", gap, "scaffold", "yes", "proximity_ligation"]
-            tempagpwithgap.append(gap_item)
-        tempagp.iloc[-1, 3] = 2 * len(tempagp)-1
-        tempagpwithgap.append(list(tempagp.iloc[-1, :]))
-        pd_tempagpwithgap = pd.DataFrame(data=tempagpwithgap,columns=AGP_HEADER)
-        agp_list.append([chrom,pd_tempagpwithgap.iloc[-1, 2],pd_tempagpwithgap])
-        # all_agp = all_agp.append(tempagp)
+        rows = []
+        start = 1
+        scaffolds = Chrom_Dict[chrom]["Scaffold"]
+        orientations = Chrom_Dict[chrom]["Oritention"]
+        scaffold_lens = Chrom_Dict[chrom]["Scaffold_len"]
+        for i in range(len(scaffolds)):
+            contig_len = int(scaffold_lens[i])
+            end = start + contig_len - 1
+            rows.append([chrom, start, end, 2 * i + 1, "W", scaffolds[i], 1, contig_len,
+                         Orientation2sign[orientations[i]]])
+            if i < len(scaffolds) - 1:
+                rows.append([chrom, end + 1, end + gap, 2 * (i + 1), "U", gap, "scaffold", "yes",
+                             "proximity_ligation"])
+                start = end + gap + 1
+        if rows:
+            agp_list.append([chrom, rows[-1][2], rows])
     agp_list.sort(key=lambda i:i[1],reverse=True)
+    all_rows = []
     for i in range(len(agp_list)):
-        agp_list[i][2].iloc[:,0]=f"scaffold_{i+1}"
-        all_agp = pd.concat([all_agp,agp_list[i][2]]) # for pandas2
-    return all_agp
+        chrom_name = f"scaffold_{i+1}"
+        for row in agp_list[i][2]:
+            row[0] = chrom_name
+            all_rows.append(row)
+    return pd.DataFrame(data=all_rows, columns=AGP_HEADER)
 
 
 
 def read_init_maps(filename):
     connection_tags = ['es','ss', 'ee','se']
     with h5py.File("tmp/init_map_params.h5", "r") as init_h5:
-        size_dict = pickle.loads(init_h5["size_dict"][()])
+        size_dict = load_pickle(init_h5["size_dict"][()])
         binsize = init_h5["binsize"][()]
-        Scaffolds_len_dict = pickle.loads(init_h5["Scaffolds_len_dict"][()])
+        Scaffolds_len_dict = load_pickle(init_h5["Scaffolds_len_dict"][()])
     str1, chr1, pos1, frag1, str2, chr2, pos2, frag2 = 0, 1, 2, 3, 4, 5, 6, 7
     with h5py.File("{}_contactmap.h5".format(filename), "w") as init_array_h5:
         with open(filename) as inputfile:
@@ -1319,9 +1338,9 @@ def create_init_contact_map(init_contact,Scaffolds_len_dict,Process_num,list_tem
                    stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     ### 并行化读取
     with h5py.File("tmp/init_map_params.h5", "w") as init_h5:
-        init_h5["size_dict"] = pickle.dumps(size_dict_init, protocol=0)
+        init_h5["size_dict"] = dump_pickle(size_dict_init)
         init_h5["binsize"] = binsize
-        init_h5["Scaffolds_len_dict"] = pickle.dumps(Scaffolds_len_dict, protocol=0)
+        init_h5["Scaffolds_len_dict"] = dump_pickle(Scaffolds_len_dict)
     with Pool(processes=Process_num) as pool:
         pool.map(read_init_maps, list_temp_names)
     for temp_name in list_temp_names:
@@ -1467,10 +1486,16 @@ def get_all_conections(iteration,agp_iter_name,init_agp,connections,conection_di
 def get_short_format(orig_contact):
     with open(orig_contact) as inputfile:
         with open("merged_nodups_short_format.txt", 'w') as outfile:
+            tmp_write = []
             for item in inputfile:
-                itemlist = item.split()
+                itemlist = item.split(maxsplit=8)
                 # if (int(itemlist[8]) >= quality) and (int(itemlist[11]) >= quality):
-                outfile.write("\t".join(itemlist[0:8]) + '\n')
+                tmp_write.append("\t".join(itemlist[0:8]) + '\n')
+                if len(tmp_write) >= WRITE_BUFFER_LIMIT:
+                    outfile.writelines(tmp_write)
+                    tmp_write = []
+            if tmp_write:
+                outfile.writelines(tmp_write)
 
 
 # parser.add_argument("-b", "--bed", required=True, type=str, help="The bed file path!")
@@ -1502,10 +1527,8 @@ if __name__ == "__main__":
     gap=args.gap
     # check_windows = 200000
     Process_num = args.ncpus
-    cid = os.getpid()
     if not os.path.exists("./tmp"):
         os.mkdir("./tmp")
-    Generate_fasta = True
     ## for_test or for_run
     for_test = False
     # for_run = for_test
@@ -1516,8 +1539,6 @@ if __name__ == "__main__":
 
     diskcard_list = []
     split_data = {}
-    seqs_to_disk = []
-    genome_total_size = 0
     # round(trianglesize*growth_rate**2)
 
     if for_test:
@@ -1554,7 +1575,6 @@ if __name__ == "__main__":
         init_contact = orig_contact
     ## 建立初始agp 文件
     for seq in Scaffolds_len_dict:
-        genome_total_size += Scaffolds_len_dict[seq]
         Chromosome = seq
         Start = 1
         End = Scaffolds_len_dict[seq]
@@ -1585,32 +1605,36 @@ if __name__ == "__main__":
         a_len = Scaffolds_len_dict[a]
         a_bin = a_len // binsize + 1
         size_dict_init[a] = a_bin
-        repeat_dict_init[a] = np.zeros(a_bin)
+        repeat_dict_init[a] = np.zeros(a_bin, dtype=np.int32)
     #     repeat_offset_dict[a]={"start":trianglesize,"end":trianglesize}
     print("procesing repeat files")
 
     ### 并行化读取
     with h5py.File("tmp/repeat_dict.h5", "w") as repeat_h5:
         # print(repeat_dict_init)
-        repeat_h5["repeat_dict"] = pickle.dumps(repeat_dict_init, protocol=0)
-        repeat_h5["size_dict"] = pickle.dumps(size_dict_init, protocol=0)
+        repeat_h5["size_dict"] = dump_pickle(size_dict_init)
         repeat_h5["binsize"] = binsize
-        repeat_h5["Scaffolds_len_dict"] = pickle.dumps(Scaffolds_len_dict, protocol=0)
+        repeat_h5["Scaffolds_len_dict"] = dump_pickle(Scaffolds_len_dict)
 
-    with Pool(processes=Process_num) as pool:
-        pool.map(read_gloable_repeat_density, list_temp_names)
+    GLOBAL_REPEAT_DENSITY_CONTEXT = {
+        "size_dict": size_dict_init,
+        "binsize": binsize,
+    }
+    try:
+        with Pool(processes=Process_num) as pool:
+            pool.map(read_gloable_repeat_density, list_temp_names)
+    finally:
+        GLOBAL_REPEAT_DENSITY_CONTEXT = None
     for temp_name in list_temp_names:
         with h5py.File("{}.h5".format(temp_name), "r") as repeat_h5:
-            repeat_dict_temp = pickle.loads(repeat_h5["repeat_dict"][()])
-        for x in repeat_dict_init:
-            repeat_dict_init[x] += repeat_dict_temp[x]
+            repeat_dict_temp = load_pickle(repeat_h5["repeat_dict"][()])
+        for x, values in repeat_dict_temp.items():
+            repeat_dict_init[x] += values
     #         repeat_dict_init[x]["end"]+=repeat_dict_temp[x]["end"]
-    subprocess.run("rm tmp/{0}*".format(
-        "inittemp"), shell=True, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    cleanup_paths(os.path.join("tmp", "inittemp*"))
     print("procesing repeat flags")
-    all_cont = np.array([])
-    for x in repeat_dict_init:
-        all_cont = np.append(all_cont, repeat_dict_init[x][:-1])
+    all_cont_parts = [repeat_dict_init[x][:-1] for x in repeat_dict_init if repeat_dict_init[x].size > 1]
+    all_cont = np.concatenate(all_cont_parts) if all_cont_parts else np.array([0], dtype=np.int32)
     # create_init_contact_map(init_contact, Scaffolds_len_dict, Process_num, list_temp_names, size_dict_init, binsize)
     # average_links = np.median(all_cont)
     ## 更改策略，仅保留70%的序列用于组装
@@ -1664,8 +1688,7 @@ if __name__ == "__main__":
                                                                                 Process_num=Process_num)
         if flag:
             print("Reach the best!")
-            subprocess.run("rm {0}".format(contact_file.format(iteration - 1)), shell=True, check=True,
-                           stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            remove_path(contact_file.format(iteration - 1))
             break
         Scaffold_len_Dict = sovle_link(contact_file.format(iteration - 1), contact_file.format(iteration), score,
                                        oritention, Scaffold_dict, Scaffold_len_Dict, iteration, agp_iter_name, init_agp,
@@ -1684,30 +1707,24 @@ if __name__ == "__main__":
         for scaffold in scaffold_list:
             outfiles.write("{}\t{}\n".format(scaffold, for_output_dict[scaffold]))
 
-    # In[14]:
-    siedata = pd.read_csv("{}.Chrom.sizes".format(code), sep='\t', header=None)
-
-    # In[16]:
-    final_size_dict = {}
-    for item in siedata.values:
-        final_size_dict[item[0]] = int(item[1])
-
     # In[18]:
-    # if Generate_fasta and (iteration > 0):
     pd_data_list = []
     pd_data_list.append(pd.read_csv(init_agp, names=AGP_HEADER,sep='\t',index_col=False))
     for i in range(iteration):
         temp_pd = pd.read_csv(agp_iter_name.format(i), names=AGP_HEADER,sep='\t',index_col=False)
         pd_data_list.append(temp_pd)
+    pd_group_list = [{chrom: temp_agp for chrom, temp_agp in pd_data.groupby("Chromosome", sort=False)}
+                     for pd_data in pd_data_list]
     Chrom_list = list(pd.Categorical(pd_data_list[-1].Chromosome).categories)
     Chrom_Dict = {}
     for i in Chrom_list:
         Chrom_Dict[i] = {}
-        temp_agp = pd_data_list[-1][pd_data_list[-1].Chromosome == i]
+        temp_agp = pd_group_list[-1][i]
         Chrom_Dict[i]["Scaffold"] = list(temp_agp.Contig_ID)
         Chrom_Dict[i]["Oritention"] = list(temp_agp.Orientation)
         Chrom_Dict[i]["Scaffold_len"] = list(temp_agp.Contig_end)
     for i in range(len(pd_data_list) - 2, -1, -1):
+        pd_groups = pd_group_list[i]
         templist = set([])
         for chrom in Chrom_Dict:
             temp_Scaffold = []
@@ -1715,7 +1732,7 @@ if __name__ == "__main__":
             temp_Scaffold_len = []
             for j in range(len(Chrom_Dict[chrom]["Scaffold"])):
                 templist.add(Chrom_Dict[chrom]["Scaffold"][j])
-                temp_agp = pd_data_list[i][pd_data_list[i].Chromosome == Chrom_Dict[chrom]["Scaffold"][j]]
+                temp_agp = pd_groups[Chrom_Dict[chrom]["Scaffold"][j]]
                 #             print()
                 if Chrom_Dict[chrom]["Oritention"][j] == 1:
                     temp_Scaffold.extend(list(temp_agp.Contig_ID[::-1]))
@@ -1728,11 +1745,11 @@ if __name__ == "__main__":
             Chrom_Dict[chrom]["Scaffold"] = temp_Scaffold
             Chrom_Dict[chrom]["Oritention"] = temp_Oritention
             Chrom_Dict[chrom]["Scaffold_len"] = temp_Scaffold_len
-        temchrom = set(pd_data_list[i].Chromosome)
+        temchrom = set(pd_groups)
         newset = temchrom - templist
         for k in newset:
             Chrom_Dict[k] = {}
-            temp_agp = pd_data_list[i][pd_data_list[i].Chromosome == k]
+            temp_agp = pd_groups[k]
             Chrom_Dict[k]["Scaffold"] = list(temp_agp.Contig_ID)
             Chrom_Dict[k]["Oritention"] = list(temp_agp.Orientation)
             Chrom_Dict[k]["Scaffold_len"] = list(temp_agp.Contig_end)
@@ -1751,21 +1768,18 @@ if __name__ == "__main__":
                    shell=True,
                    check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     with h5py.File("tmp/convert.h5", "w") as convert:
-        convert["Scaffold_dict_list"] = pickle.dumps(Scaffold_dict_list, protocol=0)
-        convert["scaffold_index_dict"] = pickle.dumps(scaffold_index_dict, protocol=0)
-        convert["fake_chrom_dict"] = pickle.dumps(fake_chrom_dict, protocol=0)
-        convert["faker_scaffold_len_dict"] = pickle.dumps(faker_scaffold_len_dict, protocol=0)
+        convert["Scaffold_dict_list"] = dump_pickle(Scaffold_dict_list)
+        convert["scaffold_index_dict"] = dump_pickle(scaffold_index_dict)
+        convert["fake_chrom_dict"] = dump_pickle(fake_chrom_dict)
+        convert["faker_scaffold_len_dict"] = dump_pickle(faker_scaffold_len_dict)
         convert["binsize"] = binsize
     list_temp_names = []
     for i in range(Process_num):
         list_temp_names.append("tmp/{0}{1:0>3d}".format("convertemp", i))
-    survey_contig(list_temp_names, Process_num)
 
     with Pool(processes=Process_num) as pool:
         pool.map(convert_contactmat, list_temp_names)
-    subprocess.run("cat tmp/{0}*.re >{1};rm tmp/*".format("convertemp",
-                                                          "{}.txt".format(code)), shell=True, check=True,
-                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    merge_tmp_re_files("convertemp", "{}.txt".format(code), clean_tmp=True)
 
 
 
@@ -1790,9 +1804,6 @@ if __name__ == "__main__":
                                                     "{}.txt".format(code) + ".re.sort",code,
                                                     "{}.Chrom.sizes".format(code)), shell=True, check=True,
                    stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    subprocess.run("rm {0}".format("{}.txt".format(code)), shell=True, check=True,
-                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    subprocess.run("rm {0}".format("{}.txt".format(code)+ ".re"), shell=True, check=True,
-                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    subprocess.run("rm {0}".format("{}.txt".format(code) + ".re.sort"), shell=True, check=True,
-                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    remove_path("{}.txt".format(code))
+    remove_path("{}.txt".format(code)+ ".re")
+    remove_path("{}.txt".format(code) + ".re.sort")
