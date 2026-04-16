@@ -2,6 +2,19 @@
 
 High-quality, chromosome-scale genomes are essential for genomic analyses. Analyses, including 3D genomics, epigenetics, and comparative genomics, rely on a high-quality genome assembly, which is often assembled with the assistance of Hi-C data. However, current Hi-C assisted assembling algorithms either generate ordering and orientation errors, or fail to assemble high-quality chromosome-level scaffolds. Here, we offer Puzzle Hi-C, which is software that uses Hi-C reads to assign accurately contigs or scaffolds to chromosomes. Puzzle Hi-C uses the triangle region instead of the square region to count interactions in a Hi-C heatmap. This strategy dramatically diminishes scaffolding interference caused by long-range interactions. This software also introduces a dynamic, triangle window strategy during assembling. The triangle window is initially small and expands with interactions to produce more effective clustering. We show that Puzzle Hi-C outperforms state-of-the-art tools for scaffolding.
 
+## Recent updates
+The latest update focuses on reducing memory usage and improving runtime efficiency while preserving the original scaffolding behavior.
+
+Main improvements:
+
+* Replaced the dense pair-orientation counting matrix with sparse accumulation for observed Hi-C links.
+* Reduced the orientation matrix memory footprint by storing orientation values with a smaller integer type.
+* Avoided large temporary upper-triangle index arrays during orientation matrix mirroring.
+* Reused read-only worker context during multiprocessing on Linux to reduce repeated deserialization and duplicated worker memory.
+* Kept compatibility fallbacks for environments that cannot inherit multiprocessing context.
+
+In an _Arabidopsis thaliana_ 1 Mb contig benchmark on 35 CPU workers, peak memory usage was reduced from `19103504K` in the previous version to `6333308K` in the optimized version, while the test completed successfully and generated the expected `.agp`, `.fa`, `.Chrom.sizes`, and `.hic` outputs.
+
 ## Installation
 #### python 3.9.0
 * biopython==1.81
@@ -111,8 +124,12 @@ python agp2assembly.py -a agpfile -m merge_nodup.txt -j {Juicer}/PBS/scripts/jui
 ```shell
 python agp2assembly.py -a assembly_file -g 100 -p prefix
 ```
-### 
+
+## Citation
+If you use Puzzle Hi-C in your work, please cite:
+
+Lin G, Huang Z, Yue T, Chai J, Li Y, Yang H, et al. (2024) Puzzle Hi-C: An accurate scaffolding software. PLoS ONE 19(7): e0298564. https://doi.org/10.1371/journal.pone.0298564
+
 ## To do list
 
 *  ~~Generate  ```.assembly``` file for Juicebox Assembly Tools (JBAT)~~
-
