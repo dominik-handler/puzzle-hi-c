@@ -38,7 +38,7 @@ pip install -r requirements.txt
 ## Usage
 ```bash
 usage: main.py [-h] -c CLUSTERS -m MATRIX -j JUICER_TOOLS -f FASTA [-p PREFIX] [-s BINSIZE] [-t CUTOFF] [-i INIT_TRIANGLESIZE]
-               [-n NCPUS] [-e] [-g GAP]
+               [-n NCPUS] [-e] [-g GAP] [--resume-from-agp RESUME_FROM_AGP]
 
 optional arguments:
   -h, --help            show this help message and exit
@@ -63,6 +63,8 @@ optional arguments:
   -e, --error_correction
                         For error correction! Default: False.
   -g GAP, --gap GAP     The size of gap between scaffolds. Default: 100.
+  --resume-from-agp RESUME_FROM_AGP
+                        Resume from a custom AGP file and only run final FASTA/HiC generation steps.
 
                         
 eg: python3 /public/home/lgl/software/puzzle-hic/main.py -c 5 -p Arabidopsis -s 10000 -t 0.35 -i 6 -m merged_nodups.txt -f ./ref/Arabidopsis_1M.fasta -j /public/home/lgl/software/juicer/PBS/scripts/juicer_tools -n 35

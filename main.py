@@ -41,6 +41,8 @@ parser.add_argument('-i', '--init_trianglesize', default=3, type=int, help='Init
 parser.add_argument('-n', '--ncpus', default=1, type=int, help='Number of threads. Default: 1.')
 parser.add_argument("-e", "--error_correction",action="store_true",help="For error correction! Default: False.")
 parser.add_argument("-g", "--gap",default=100, type=int,help="The size of gap between scaffolds. Default: 100.")
+parser.add_argument("--resume-from-agp", default=None, type=str,
+                    help="Resume from a custom AGP file and only run final FASTA/HiC generation steps.")
 # parser.add_argument("-r", "--filter",action="store_true",help="Filter! Default: False")
 
 ## 定义每个连接方式序列对应的头部和尾部contig的方向，0代表头部，1代表尾部,0和1分别代表apg文件中得正向和反向
@@ -1079,7 +1081,7 @@ def sovle_link(inputfile, outputfile, score, oritention, Scaffold_dict, Scaffold
             path_orientation = orientation(p, oritention, head_dict, end_dict)
             final_path_orientation.append(path_orientation)
     ## 将path中的scaffold连接起来形成新的scaffold
-    # agp 文件生成：Chromosome	Start	End	Order	Tag	Contig_ID	Contig_start	Contig_end	Orientation
+    # agp 文件生成：Chromosome       Start   End     Order   Tag     Contig_ID       Contig_start    Contig_end      Orientation
     agp_list = []
     # block_mark = {}
     for i in range(len(final_path)):
@@ -1498,6 +1500,72 @@ def get_short_format(orig_contact):
                 outfile.writelines(tmp_write)
 
 
+def load_resume_agp(agp_path):
+    if not os.path.exists(agp_path):
+        raise FileNotFoundError(f"AGP file not found: {agp_path}")
+    all_agp = pd.read_csv(agp_path, names=AGP_HEADER, sep='\t', index_col=False)
+    if all_agp.empty:
+        raise ValueError(f"AGP file is empty: {agp_path}")
+    required_tags = {"W", "N", "U"}
+    if not any(str(tag) in required_tags for tag in all_agp.Tag):
+        raise ValueError("Input AGP file appears invalid: no AGP component tags found in column 5.")
+    return all_agp
+
+
+def chrom_sort_key(chrom_name):
+    chrom_name = str(chrom_name)
+    if chrom_name.startswith("scaffold_"):
+        suffix = chrom_name[9:]
+        if suffix.isdigit():
+            return 0, int(suffix)
+    return 1, chrom_name
+
+
+def run_post_agp_steps(all_agp, code, fastafile_name, binsize, Process_num, juicer_tools):
+    all_agp_path = "./{}.agp".format(code)
+    all_agp.to_csv(all_agp_path, sep='\t', header=False, index=False)
+    gf.main(all_agp_path, fastafile_name, code)
+
+    fake_chrom_dict, Scaffold_dict_list, scaffold_index_dict, faker_scaffold_len_dict = JBAT.get_convert_info(all_agp)
+
+    subprocess.run("split -a 3 -n l/{0} -d {1} tmp/{2}".format(Process_num,
+                                                               "merged_nodups_short_format.txt", "convertemp"),
+                   shell=True,
+                   check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    with h5py.File("tmp/convert.h5", "w") as convert:
+        convert["Scaffold_dict_list"] = dump_pickle(Scaffold_dict_list)
+        convert["scaffold_index_dict"] = dump_pickle(scaffold_index_dict)
+        convert["fake_chrom_dict"] = dump_pickle(fake_chrom_dict)
+        convert["faker_scaffold_len_dict"] = dump_pickle(faker_scaffold_len_dict)
+        convert["binsize"] = binsize
+    list_temp_names = []
+    for i in range(Process_num):
+        list_temp_names.append("tmp/{0}{1:0>3d}".format("convertemp", i))
+
+    with Pool(processes=Process_num) as pool:
+        pool.map(convert_contactmat, list_temp_names)
+    merge_tmp_re_files("convertemp", "{}.txt".format(code), clean_tmp=True)
+
+    chrom_size_dict = JBAT.get_chrom_size_from_agp(all_agp)
+    with open("{}.Chrom.sizes".format(code), 'w') as outfiles:
+        chrom_keys = list(chrom_size_dict.keys())
+        chrom_keys.sort(key=chrom_sort_key)
+        for scaffold in chrom_keys:
+            outfiles.write("{}\t{}\n".format(scaffold, chrom_size_dict[scaffold]))
+
+    converscript.convert_data(chrom_size_dict, "{}.txt".format(code), "{}.txt".format(code) + ".re")
+    subprocess.run("LC_ALL=C sort -k2,2 -k6,6 {0}>{1}".format("{}.txt".format(code) + ".re",
+                                                                "{}.txt".format(code) + ".re.sort"),
+                   shell=True, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    subprocess.run("{0} pre {1} {2}.hic {3}".format(juicer_tools,
+                                                    "{}.txt".format(code) + ".re.sort", code,
+                                                    "{}.Chrom.sizes".format(code)), shell=True, check=True,
+                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    remove_path("{}.txt".format(code))
+    remove_path("{}.txt".format(code) + ".re")
+    remove_path("{}.txt".format(code) + ".re.sort")
+
+
 # parser.add_argument("-b", "--bed", required=True, type=str, help="The bed file path!")
 # parser.add_argument('-m', '--matrix', required=True, type=str, help='The matrix file path!')
 if __name__ == "__main__":
@@ -1519,6 +1587,7 @@ if __name__ == "__main__":
     get_short_format(args.matrix)
     orig_contact="merged_nodups_short_format.txt"
     fastafile_name = args.fasta
+    resume_from_agp = args.resume_from_agp
 
     init_trianglesize = args.init_trianglesize
     growth_rate = 1.4
@@ -1529,6 +1598,12 @@ if __name__ == "__main__":
     Process_num = args.ncpus
     if not os.path.exists("./tmp"):
         os.mkdir("./tmp")
+
+    if resume_from_agp:
+        all_agp = load_resume_agp(resume_from_agp)
+        run_post_agp_steps(all_agp, code, fastafile_name, binsize, Process_num, juicer_tools)
+        sys.exit(0)
+
     ## for_test or for_run
     for_test = False
     # for_run = for_test
@@ -1754,56 +1829,4 @@ if __name__ == "__main__":
             Chrom_Dict[k]["Oritention"] = list(temp_agp.Orientation)
             Chrom_Dict[k]["Scaffold_len"] = list(temp_agp.Contig_end)
     all_agp = generate_final_agp(Chrom_Dict,gap)
-    all_agp.to_csv("./{}.agp".format(code), sep='\t',header=False,index=False)
-    gf.main("./{}.agp".format(code),fastafile_name,code)
-
-    # In[19]:
-
-    fake_chrom_dict, Scaffold_dict_list, scaffold_index_dict,faker_scaffold_len_dict = JBAT.get_convert_info(all_agp)
-
-    # In[20]:
-    # subprocess.run("rm tmp/*", shell=True, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    subprocess.run("split -a 3 -n l/{0} -d {1} tmp/{2}".format(Process_num,
-                                                               "merged_nodups_short_format.txt", "convertemp"),
-                   shell=True,
-                   check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    with h5py.File("tmp/convert.h5", "w") as convert:
-        convert["Scaffold_dict_list"] = dump_pickle(Scaffold_dict_list)
-        convert["scaffold_index_dict"] = dump_pickle(scaffold_index_dict)
-        convert["fake_chrom_dict"] = dump_pickle(fake_chrom_dict)
-        convert["faker_scaffold_len_dict"] = dump_pickle(faker_scaffold_len_dict)
-        convert["binsize"] = binsize
-    list_temp_names = []
-    for i in range(Process_num):
-        list_temp_names.append("tmp/{0}{1:0>3d}".format("convertemp", i))
-
-    with Pool(processes=Process_num) as pool:
-        pool.map(convert_contactmat, list_temp_names)
-    merge_tmp_re_files("convertemp", "{}.txt".format(code), clean_tmp=True)
-
-
-
-    # In[27]:
-    chrom_size_dict = JBAT.get_chrom_size_from_agp(all_agp)
-    with open("{}.Chrom.sizes".format(code), 'w') as outfiles:
-        chrom_keys=list(chrom_size_dict.keys())
-        chrom_keys.sort(key=lambda x:int(x[9:]))
-        for scaffold in chrom_keys:
-            outfiles.write("{}\t{}\n".format(scaffold, chrom_size_dict[scaffold]))
-
-    # In[30]:
-    converscript.convert_data(chrom_size_dict,"{}.txt".format(code),"{}.txt".format(code) + ".re")
-    # subprocess.run("python {0} {1} {2} {3}".format(converscript, "{}.Chrom.sizes".format(code),
-    #                                                contact_file.format(iteration),
-    #                                                contact_file.format(iteration) + ".re"),
-    #                shell=True, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    subprocess.run("LC_ALL=C sort -k2,2 -k6,6 {0}>{1}".format("{}.txt".format(code)+ ".re",
-                                                                    "{}.txt".format(code) + ".re.sort"),
-                   shell=True, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    subprocess.run("{0} pre {1} {2}.hic {3}".format(juicer_tools,
-                                                    "{}.txt".format(code) + ".re.sort",code,
-                                                    "{}.Chrom.sizes".format(code)), shell=True, check=True,
-                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    remove_path("{}.txt".format(code))
-    remove_path("{}.txt".format(code)+ ".re")
-    remove_path("{}.txt".format(code) + ".re.sort")
+    run_post_agp_steps(all_agp, code, fastafile_name, binsize, Process_num, juicer_tools)
